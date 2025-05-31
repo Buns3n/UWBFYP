@@ -1,0 +1,336 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_BMP3XX.h>
+#include <Adafruit_SSD1306.h>
+#include <HardwareSerial.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include "esp_bt.h"
+#include "esp_wifi.h"
+#include <math.h>
+
+// -------------------- Kalman Filter Class --------------------
+class SimpleKalmanFilter {
+  float estimate;
+  float errorEstimate;
+  float errorMeasure;
+  float kalmanGain;
+
+public:
+  SimpleKalmanFilter(float mea_e, float est_e, float init_est) {
+    errorMeasure = mea_e;
+    errorEstimate = est_e;
+    estimate = init_est;
+  }
+
+  float updateEstimate(float measurement) {
+    kalmanGain = errorEstimate / (errorEstimate + errorMeasure);
+    estimate = estimate + kalmanGain * (measurement - estimate);
+    errorEstimate = (1.0 - kalmanGain) * errorEstimate;
+    return estimate;
+  }
+
+  void setEstimate(float est) { estimate = est; }
+  float getEstimate() { return estimate; }
+};
+
+// -------------------- WiFi/Bluetooth Disable --------------------
+void disableWiFiBluetooth() {
+  WiFi.mode(WIFI_OFF);
+  btStop();
+  esp_bt_controller_disable();
+}
+
+// -------------------- Definitions --------------------
+#define IO_RXD2 17
+#define IO_TXD2 18
+#define LORA_RX 9
+#define LORA_TX 8
+#define RESET_PIN 16
+#define SD_CS 5
+#define SEA_LEVEL_PRESSURE 1028.0
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define BTN_ENTER 15
+#define BTN_UP    4
+#define BTN_DOWN  10
+
+HardwareSerial UWBSerial(2);
+HardwareSerial LoRaSerial(1);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+Adafruit_BMP3XX bmp;
+Preferences prefs;
+
+enum MenuState {
+  MENU_MAIN,
+  MENU_SETTINGS,
+  MENU_UNITS,
+  MENU_ENGINEER,
+  MENU_ACTIVE_DATA
+};
+
+MenuState currentMenu = MENU_MAIN;
+int menuIndex = 0;
+int unitsMenuIndex = 0;
+bool useYards = false;
+
+float handheldAlt = 0.0;
+float staticAlt = 0.0;
+float altDiff = 0.0;
+float uwbDist = 0.0;
+float rssi = 0.0;
+float trueDist = 0.0;
+String clubLabel = "N/A";
+
+unsigned long lastDisplayTime = 0;
+unsigned long lastButtonPress = 0;
+unsigned long lastUpdateTime = 0;
+unsigned long dataActiveStart = 0;
+unsigned long enterPressStart = 0;
+bool enterHoldTriggered = false;
+
+#define BUTTON_DEBOUNCE 150
+#define DISPLAY_INTERVAL 3000
+#define UPDATE_INTERVAL 1000
+#define DATA_ACTIVE_DURATION 15000
+
+bool dataActive = false;
+bool uwbConfigured = false;
+
+// -------------------- Kalman Filter for UWB --------------------
+SimpleKalmanFilter kalmanUWB(0.5, 1, 0); // measurement error, estimate error, initial estimate
+
+float convertDistance(float meters) {
+  return useYards ? meters * 1.09361 : meters;
+}
+
+void updateClubLabel(float distance) {
+  File file = SD.open("/clubmap.csv");
+  if (!file) {
+    clubLabel = "N/A";
+    return;
+  }
+  clubLabel = "N/A";
+  bool firstLine = true;
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    if (firstLine) { firstLine = false; continue; }
+    int c1 = line.indexOf(',');
+    int c2 = line.indexOf(',', c1 + 1);
+    if (c1 == -1 || c2 == -1) continue;
+    float min = line.substring(0, c1).toFloat();
+    float max = line.substring(c1 + 1, c2).toFloat();
+    String label = line.substring(c2 + 1);
+    if (distance >= min && distance < max) {
+      clubLabel = label;
+      break;
+    }
+  }
+  file.close();
+}
+
+void saveUnitSetting(bool yards) {
+  prefs.begin("settings", false);
+  prefs.putBool("useYards", yards);
+  prefs.end();
+}
+
+void loadUnitSetting() {
+  prefs.begin("settings", true);
+  useYards = prefs.getBool("useYards", false);
+  unitsMenuIndex = useYards ? 1 : 0;
+  prefs.end();
+}
+
+void checkButtons() {
+  unsigned long now = millis();
+  if (digitalRead(BTN_ENTER) == LOW) {
+    if (enterPressStart == 0) enterPressStart = now;
+    else if (!enterHoldTriggered && now - enterPressStart >= 2500) {
+      currentMenu = MENU_MAIN;
+      enterHoldTriggered = true;
+    }
+  } else {
+    if (enterPressStart != 0 && !enterHoldTriggered && now - enterPressStart < 2500) {
+      lastButtonPress = now;
+      if (currentMenu == MENU_MAIN) {
+        if (menuIndex == 0) {
+          dataActive = true;
+          dataActiveStart = millis();
+          LoRaSerial.println("WAKE");
+          LoRaSerial.flush();
+          currentMenu = MENU_ACTIVE_DATA;
+        } else if (menuIndex == 1) {
+          currentMenu = MENU_SETTINGS;
+          menuIndex = 0;
+        }
+      } else if (currentMenu == MENU_SETTINGS) {
+        currentMenu = (menuIndex == 0) ? MENU_UNITS : MENU_ENGINEER;
+      } else if (currentMenu == MENU_UNITS) {
+        useYards = (unitsMenuIndex == 1);
+        saveUnitSetting(useYards);
+        currentMenu = MENU_SETTINGS;
+      } else if (currentMenu == MENU_ENGINEER) {
+        currentMenu = MENU_SETTINGS;
+      }
+    }
+    enterPressStart = 0;
+    enterHoldTriggered = false;
+  }
+
+  if (digitalRead(BTN_UP) == LOW && now - lastButtonPress > BUTTON_DEBOUNCE) {
+    if (currentMenu == MENU_MAIN || currentMenu == MENU_SETTINGS) {
+      menuIndex = (menuIndex - 1 + 2) % 2;
+    } else if (currentMenu == MENU_UNITS) {
+      unitsMenuIndex = (unitsMenuIndex - 1 + 2) % 2;
+    }
+    lastButtonPress = now;
+  }
+  if (digitalRead(BTN_DOWN) == LOW && now - lastButtonPress > BUTTON_DEBOUNCE) {
+    if (currentMenu == MENU_MAIN || currentMenu == MENU_SETTINGS) {
+      menuIndex = (menuIndex + 1) % 2;
+    } else if (currentMenu == MENU_UNITS) {
+      unitsMenuIndex = (unitsMenuIndex + 1) % 2;
+    }
+    lastButtonPress = now;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  disableWiFiBluetooth();
+  UWBSerial.begin(115200, SERIAL_8N1, IO_RXD2, IO_TXD2);
+  LoRaSerial.begin(9600, SERIAL_8N1, LORA_RX, LORA_TX);
+  Wire.begin(39, 38);
+
+  pinMode(RESET_PIN, OUTPUT);
+  pinMode(BTN_ENTER, INPUT_PULLUP);
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+
+  digitalWrite(RESET_PIN, LOW); delay(100);
+  digitalWrite(RESET_PIN, HIGH); delay(1500);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) while (1);
+  if (!bmp.begin_I2C(0x77)) while (1);
+  if (!SD.begin(SD_CS)) Serial.println("SD Card Init Failed.");
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println("HANDHELD READY");
+  display.display();
+
+  loadUnitSetting();
+}
+
+void loop() {
+  unsigned long now = millis();
+  checkButtons();
+
+  if (dataActive && now - dataActiveStart > DATA_ACTIVE_DURATION) {
+    dataActive = false;
+    currentMenu = MENU_MAIN;
+  }
+
+  if (!uwbConfigured && now > 2000) {
+    UWBSerial.println("AT+SETCFG=0,0,1,3");
+    uwbConfigured = true;
+  }
+
+  if (bmp.performReading()) {
+    handheldAlt = bmp.readAltitude(SEA_LEVEL_PRESSURE);
+  }
+
+  while (LoRaSerial.available()) {
+    String msg = LoRaSerial.readStringUntil('\n');
+    msg.trim();
+    if (msg.startsWith("ALT:")) {
+      staticAlt = msg.substring(4).toFloat();
+    }
+  }
+
+  if (dataActive && now - lastUpdateTime >= UPDATE_INTERVAL) {
+    UWBSerial.println("AT+RANGE");
+    delay(500);
+    lastUpdateTime = now;
+  }
+
+  while (UWBSerial.available()) {
+    String line = UWBSerial.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("AT+RANGE=")) {
+      int rangeStart = line.indexOf("range:(") + 7;
+      int rangeEnd = line.indexOf(")", rangeStart);
+      if (rangeStart > 6 && rangeEnd > rangeStart) {
+        String data = line.substring(rangeStart, rangeEnd);
+        int comma = data.indexOf(",");
+        if (comma != -1) {
+          String after = data.substring(comma + 1);
+          int comma2 = after.indexOf(",");
+          if (comma2 != -1) {
+            float rawUWB = after.substring(0, comma2).toFloat() / 100.0;
+
+            // Optional correction
+            if (rawUWB >= 75.0) rawUWB *= 1.02;
+
+            // Apply Kalman filtering
+            uwbDist = kalmanUWB.updateEstimate(rawUWB);
+          }
+        }
+      }
+
+      int rssiStart = line.indexOf("rssi:(") + 6;
+      int rssiEnd = line.indexOf(")", rssiStart);
+      if (rssiStart > 6 && rssiEnd > rssiStart) {
+        String rssiData = line.substring(rssiStart, rssiEnd);
+        int comma = rssiData.indexOf(",");
+        if (comma != -1) {
+          rssi = rssiData.substring(0, comma).toFloat();
+        }
+      }
+    }
+  }
+
+  altDiff = staticAlt - handheldAlt;
+  trueDist = (uwbDist > 0.01) ? sqrt((uwbDist * uwbDist) + (altDiff * altDiff)) : 0.0;
+  if (dataActive) updateClubLabel(convertDistance(trueDist));
+
+  if (now - lastDisplayTime >= DISPLAY_INTERVAL) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+
+    if (currentMenu == MENU_MAIN) {
+      display.println(menuIndex == 0 ? "> DISTANCE + CLUB" : "  DISTANCE + CLUB");
+      display.println(menuIndex == 1 ? "> SETTINGS" : "  SETTINGS");
+    } else if (currentMenu == MENU_SETTINGS) {
+      display.println("SETTINGS:");
+      display.println(menuIndex == 0 ? "> Units (m/yd)" : "  Units (m/yd)");
+      display.println(menuIndex == 1 ? "> Engineer View" : "  Engineer View");
+    } else if (currentMenu == MENU_UNITS) {
+      display.println("SELECT UNITS:");
+      display.println(unitsMenuIndex == 0 ? "> Meters" : "  Meters");
+      display.println(unitsMenuIndex == 1 ? "> Yards" : "  Yards");
+    } else if (currentMenu == MENU_ENGINEER) {
+      display.println("ENGINEER VIEW");
+      display.print("Alt HH: "); display.println(handheldAlt, 2);
+      display.print("Alt Static: "); display.println(staticAlt, 2);
+      display.print("2D Dist: "); display.println(uwbDist, 2);
+      display.print("RSSI: "); display.println(rssi, 1);
+    } else if (currentMenu == MENU_ACTIVE_DATA) {
+      display.println("\xF0\x9F\x93\xA1 DATA ACTIVE");
+      display.print("3D Dist: ");
+      display.print(convertDistance(trueDist), 2);
+      display.println(useYards ? " yd" : " m");
+      display.print("Club: ");
+      display.println(clubLabel);
+    }
+
+    display.display();
+    lastDisplayTime = now;
+  }
+}
