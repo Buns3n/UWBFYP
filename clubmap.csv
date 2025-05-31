@@ -1,0 +1,15 @@
+min_distance,max_distance,club_name
+0,50,Lob Wedge
+50,70,Sand Wedge
+70,90,Gap Wedge
+90,110,Pitching Wedge
+110,125,9 Iron
+125,135,8 Iron
+135,145,7 Iron
+145,155,6 Iron
+155,165,5 Iron
+165,175,4 Iron
+175,185,3 Iron
+185,200,Hybrid
+200,220,3 Wood
+220,270,Driver
